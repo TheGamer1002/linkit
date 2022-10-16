@@ -1,5 +1,5 @@
 ## Handling arguments
-
+# TODO: loop in the message box api. Still struggling w/ that.
 Param (
     [Parameter(Position=0)][string]$Target,
     [string]$Destination,
@@ -34,24 +34,26 @@ EXIT CODES:
 6: User cancelled operation: Folder destination selection
 7: User cancelled operation: No config file created
 8: Config file is malformed or doesn't exist
+9: Copied checksum does not match original checksum
+10: Permissions error
 #>
 
 ## Functions: Create dialog boxes for errors and successes
 Function Get-error ($i) {
     if ($false -eq $Quiet) {
-        Write-Output "ERR: $i"
+        wo "ERR: $i"
         [System.Windows.MessageBox]::Show("Error: $i","Linkit", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
     }
 }
 Function fatal ($i) {
     if ($false -eq $Quiet) {
-        Write-Output "FATAL: $i"
+        wo "FATAL: $i"
         [System.Windows.MessageBox]::Show("Fatal Error! $i","Linkit", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
     }
 }
 Function success ($folder,$dest) {
     if ($false -eq $Quiet) {
-        Write-Output "INFO: Moved input folder $folder to $dest"
+        wo "INFO: Moved input folder $folder to $dest"
         [System.Windows.MessageBox]::Show("Success: Moved input folder $folder to $dest", "Linkit", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
     }
 }
@@ -60,7 +62,10 @@ Function wo ($i) {
     if ($false -eq $Quiet) {
         Write-Output $i
     }
+    Out-File -FilePath %appdata%/linkit/latest.log -Append
+    Out-File -FilePath $LogDated -Append
 }
+
 ## Read config file
 function Get-ConfigFile {
     # Check if config file exists
@@ -72,15 +77,20 @@ function Get-ConfigFile {
         if ($null -eq $config) {
 
             # Prompt for new config file
-            Write-Output "WARN: No config file found. Prompting for next steps..."
+            wo "WARN: No config file found. Prompting for next steps..."
             $Private:result = [System.Windows.MessageBox]::Show("No config file found. Create one now?","Linkit", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question) -eq "Yes"
             
             if ($result) {
-                Write-Output "INFO: User chose to create a new config file"
+                wo "INFO: User chose to create a new config file"
 
                 # Create config file
-                wo "INFO: Creating config directory..."
-                New-Item -ItemType Directory -Path %appdata%\linkit -Force
+
+                if (Test-Path -Path %appdata%\linkit) {
+                    wo "INFO: Config directory already exists"
+                } else {
+                    wo "INFO: Creating config directory"
+                    New-Item -ItemType Directory -Path %appdata%\linkit
+                }
 
                 wo "INFO: Creating config file..."
                 $config = New-Item -ItemType File -Path %appdata%\linkit\config.cfg -Force
@@ -126,8 +136,9 @@ function Get-ConfigFile {
         exit 8
     }
 }
+
 ## Move folder
-function Move-Folder ($folder) {
+function Copy-Folder ($folder,$dest) {
 
     # GitHub Copilot spaghetti incoming
     # Check if folder exists
@@ -166,7 +177,7 @@ function Move-Folder ($folder) {
 
                                 # Move folder
                                 try {
-                                    start-process powershell.exe -argument '-nologo -noprofile -executionpolicy bypass -command Move-Item -Path $folder -Destination $dest -Force'
+                                    start-process powershell.exe -argument '-nologo -noprofile -executionpolicy bypass -command Copy-Item -Path $folder -Destination $dest -Force'
                                     success $folder $dest
                                 } catch {
                                     fatal "An error occured while moving the folder: $_"
@@ -182,10 +193,10 @@ function Move-Folder ($folder) {
                     } else { # Folder can be moved safely (destination is empty)
                         # Move folder
                         try {
-                            start-process powershell.exe -argument '-nologo -noprofile -executionpolicy bypass -command Move-Item -Path $folder -Destination $dest -Force'
+                            start-process powershell.exe -argument '-nologo -noprofile -executionpolicy bypass -command Copy-Item -Path $folder -Destination $dest -Force'
                             success $folder $dest
                         } catch {
-                            fatal "An error occured while moving the folder: $_"
+                            fatal "An error occured while copying the folder: $_"
                             exit 5
                         } # END try to move folder
                     } # END check if destination is empty and move
@@ -206,6 +217,51 @@ function Move-Folder ($folder) {
         exit 2
     } # END check if input folder exists
     
+}
+
+function CompareSum ($folder,$dest) {
+    # Generate source checksum
+    wo "DBG: Generating source checksum (this might take a while)..."
+    wo "DBG: Generating and combining all file hashes..."
+    $HashStringSrc = (Get-ChildItem $folder -Recurse | Get-FileHash -Algorithm SHA512).Hash | Out-String
+    wo "DBG: Generating checksum of that list of checksums..."
+    $HashSrc = Get-FileHash -InputStream ([IO.MemoryStream]::new([char[]]$HashStringSrc))
+    wo "DBG: Source checksum generated: $HashSrc"
+    # Generate destination checksum
+    wo "DBG: Generating destination checksum (this might take a while)..."
+    wo "DBG: Generating and combining all file hashes..."
+    $HashStringDest = (Get-ChildItem $dest -Recurse | Get-FileHash -Algorithm SHA512).Hash | Out-String
+    wo "DBG: Generating checksum of that list of checksums..."
+    $HashDest = Get-FileHash -InputStream ([IO.MemoryStream]::new([char[]]$HashStringDest))
+    wo "DBG: Destination checksum generated: $HashDest"
+
+    # Compare checksums
+    $SumResult = if ($HashSrc.Hash -eq $HashDest.Hash) {
+        wo "DBG: Checksums match"
+        return $true
+    } else {
+        wo "ERR: Checksums do not match"
+        return $false
+    }
+
+    if ($SumResult) {
+        wo "DBG: Checksums match; files are valid"
+    } else {
+        get-error "Checksums do not match; files are invalid"
+        # Ask the user whether to delete the copied folder and try copying again, or to just delete the files and exit
+        $Private:result = [System.Windows.MessageBox]::Show("Checksums do not match. Delete copied files and try again?","Linkit", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question) -eq "Yes"
+        if ($Private:result) {
+            wo "DBG: User chose to delete copied files and try again"
+            Remove-Item $dest -Recurse -Force
+            wo "DBG: Deleted copied files"
+            return $true
+        } else {
+            wo "DBG: User chose to delete copied files and exit"
+            Remove-Item $dest -Recurse -Force
+            wo "DBG: Deleted copied files"
+            return $false
+        }
+    }
 }
 
 ## Create link
@@ -264,3 +320,76 @@ function New-Link ($folder,$dest) { # $folder is the folder to be linked, $dest 
     } # END check if input folder exists
 }
 
+## Main - Logging
+if (Test-Path %appdata%/linkit/latest.log) { # Check if latest log file exists
+    Remove-Item %appdata%/linkit/latest.log -Force
+    wo "DBG: Removed latest.log; new file initialized (this should be the first line in the file)"
+}
+
+# Configure the log file target
+$LogDatedTime = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+wo "DBG: Set dated log time to $LogDatedTime"
+$LogDated = %appdata%/linkit/log-\($LogDatedTime).log
+wo "DBG: Set dated log file to $LogDated"
+
+## Main - Argument parsing
+
+# -CleanConfig
+if ($CleanConfig) {
+    # Clean config
+    Remove-Item -Path %appdata%/Linkit/config.cfg -Force
+    wo "DBG: Cleaned config at user request"
+    exit 0
+}
+if ($null -eq $Target -and $false -eq $CleanConfig) { # No arguments were passed
+    # No target specified
+    fatal "No arguments!"
+    exit 1
+}
+
+# Start the actual thing
+try { # Config file loading
+    Get-ConfigFile # this is such a loaded line lmfao
+    wo "DBG: Loaded config file!"
+wo "DBG: Destination is $Config"
+} catch {
+    fatal "VERY BAD: Uncaught error occured while getting config file (this shouldn't happen): $_" # if this happens we have bigger problems
+}
+
+# and now, the part you've all been waiting for
+function copyprocess {
+    if ($null -ne $Destination) {
+        wo "DBG: Destination specified: $Destination"
+        try {
+            $FinalDestination = $Destination
+            Move-Folder $Target $Destination
+        } catch {
+            fatal "VERY BAD: Uncaught error occured while copying folder: $_"
+        }
+    } else {
+        wo "DBG: Destination not specified; using config"
+        try {
+            $FinalDestination = $Config
+            Move-Folder $Target $Config
+        } catch {
+            fatal "VERY BAD: Uncaught error occured while copying folder: $_"
+        }
+    }
+    $summing = CompareSum $Target $FinalDestination
+    if ($summing) {
+        wo "DBG: Checksums match; files are valid"
+        try {
+            Remove-Item -WhatIf $Target -Recurse
+        } catch {
+            fatal "Your files are valid, but an error occured while deleting the original folder: $_ \n This might be caused by a permissions error. The files might be important, so make sure you know what you're doing before deleting them! \n If you're sure you want to delete them, you can do so by locating the directory this script is located in, opening a new terminal session, and running the script as an administrator. The command to do this is copied to your clipboard. \n THE DEVELOPERS OF THIS SCRIPT, MICROSOFT WINDOWS, AND EVERY OTHER DEVELOPER ARE NOT LIABLE BOR LOSS OF LIFE, PROPERTY, OR DATA. YOU ARE USING THIS SCRIPT AT YOUR OWN RISK. \n There also might be a process using a file in the directory, so quit all relevant applications. \n\n YOUR FILES HAVE NOT BEEN TOUCHED."
+            $ManualCommand = "powershell -verb runas -ExecutionPolicy Bypass -File $PSScriptRoot\linkit.ps1 -Target $Target -Destination $Destination"
+            Set-Clipboard $ManualCommand
+            exit
+        }
+        New-Link $Target $FinalDestination
+    } else {
+        # At this point, the files at the destination are invalid and should have been deleted. We can safely exit.
+        success "Copied files are invalid and are deleted. Your original files are still intact."
+        exit 9
+    }
+}
