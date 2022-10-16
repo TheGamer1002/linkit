@@ -1,0 +1,3 @@
+[submodule "messagebox-windows"]
+	path = messagebox-windows
+	url = https://github.com/cubiclesoft/messagebox-windows
