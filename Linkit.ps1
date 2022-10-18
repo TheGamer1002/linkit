@@ -1,5 +1,6 @@
 ## Handling arguments
 # TODO: loop in the message box api. Still struggling w/ that.
+# ISSUES: literally nothing works. I think my computer is haunted.
 Param (
     [Parameter(Position=0)][string]$Target,
     [string]$Destination,
